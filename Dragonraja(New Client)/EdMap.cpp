@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 
 namespace
 {
@@ -129,13 +130,14 @@ bool EdMap::Load(const std::string& mapPath, std::string& err)
 
 bool EdMap::LoadSources(const std::string& sou2, std::string& err)
 {
-	m_sou2Path.clear();
+	m_sou2Path.clear(); m_sou2FileCount = 0; m_sou2Dirty = false; m_singleSource = false;
 	std::ifstream s2(sou2, std::ios::binary);
 	if (!s2) { err = "No " + FileOf(sou2); return false; }
 	m_sou2Path = sou2;
 	uint32_t fs = 0, no = 0;
 	Rd(s2, fs); Rd(s2, no);
 	if (no == 0 || no > 4096) { err = FileOf(sou2) + ": bad picture count " + std::to_string(no); return false; }
+	m_sou2FileCount = (int)no;
 	s2.seekg(6, std::ios::cur);
 
 	std::ifstream src[11];
@@ -217,12 +219,17 @@ bool EdMap::LoadSingleSource(std::string& err)
 			if (!f) { sp = EdSprite(); break; }
 		}
 	}
-	m_sou2Path.clear();
+	m_sou2Path.clear(); m_singleSource = true;
 	return true;
 }
 
-void EdMap::NewMap(int w, int h, const EdTile& fill)
+void EdMap::NewMap(int w, int h, const EdTile& fill, bool keepPictures)
 {
+	if (!keepPictures || m_spr.empty())		// an empty picture list: pictures come from other maps (AddSprite)
+	{
+		m_spr.assign(1, EdSprite());
+		m_sou2Path.clear(); m_sou2FileCount = 0; m_sou2Dirty = true; m_singleSource = false;
+	}
 	m_w = w; m_h = h; m_tiles.assign((size_t)w * h, fill);
 	Objects.clear(); ObjExtra.clear(); ObjTotalId = 0; ObjPath.clear();
 	newFormat = true; checksumError = 0; cOdd = cEven = 0; wType = 0;
@@ -260,7 +267,11 @@ bool EdMap::Save(const std::string& mapPath, std::string& err)
 
 	// saved under a new name: the map needs its picture list too
 	const std::string newSou2 = FolderOf(mapPath) + "\\" + StemOf(mapPath) + ".sou2";
-	if (!m_sou2Path.empty() && !Exists(newSou2))
+	if (m_sou2Dirty)		// pictures taken from another map: write the longer list
+	{
+		if (!SaveSou2(newSou2, err)) { err = "The map is saved but its picture list is not: " + err; return false; }
+	}
+	else if (!m_sou2Path.empty() && !Exists(newSou2))
 	{
 		std::ifstream in(m_sou2Path, std::ios::binary); std::ofstream out(newSou2, std::ios::binary);
 		out << in.rdbuf();
@@ -269,7 +280,74 @@ bool EdMap::Save(const std::string& mapPath, std::string& err)
 	const bool renamed = Upper(StemOf(mapPath)) != Upper(m_name) || ObjPath.empty();
 	m_path = mapPath; m_folder = FolderOf(mapPath); m_name = StemOf(mapPath); checksumError = 0;
 	if (m_root.empty()) m_root = FolderOf(m_folder);
+	if (m_objRoot.empty()) m_objRoot = m_root;		// a new map no map was opened before
 	if (renamed) ObjPath = m_objRoot + "\\object\\" + ObjectDirOf(m_name) + "\\" + Upper(m_name) + ".toi2";		// Save as: the objects go with the new name
+	return true;
+}
+
+// ===================================================================== pictures from another map
+// the .map holds numbers into this map's own .sou2 list, so a picture from another map is found by
+// (source, tile) here, or added to the end of the list
+int EdMap::FindSprite(const EdSprite& sp) const
+{
+	for (int i = 1; i < (int)m_spr.size(); ++i)
+		if (m_spr[i].tileNo == sp.tileNo && m_spr[i].sourceNo == sp.sourceNo && Sprite(i)) return i;
+	return -1;
+}
+
+int EdMap::AddSprite(const EdSprite& sp, std::string& err)
+{
+	if (sp.sourceNo < 0 || sp.sourceNo >= 11 || sp.tileNo <= 0 || sp.tileNo >= 3600) { err = "That picture has no source / tile number (its map has no .sou2)"; return -1; }
+	const int have = FindSprite(sp);
+	if (have > 0) return have;
+	if (m_singleSource || m_spr.empty()) { err = m_name + " has no .sou2 picture list to add to"; return -1; }
+	if (m_spr.size() >= 3600) { err = m_name + " already uses 3600 pictures, the most the client loads"; return -1; }
+	m_spr.push_back(sp);
+	m_sou2Dirty = true;
+	return (int)m_spr.size() - 1;
+}
+
+// .sou2: DWORD ?, DWORD count, 6 bytes (0, width, height), 3600 x (short tile, short source + 1), 2 bytes.
+// The bytes as read are kept; only the count and the added entries change.
+bool EdMap::SaveSou2(const std::string& sou2, std::string& err)
+{
+	std::vector<char> buf;
+	if (!m_sou2Path.empty())
+	{
+		std::ifstream in(m_sou2Path, std::ios::binary);
+		if (!in) { err = "Can't read " + m_sou2Path; return false; }
+		buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	}
+	const size_t need = 14 + 3600 * 4 + 2;
+	if (buf.empty())		// a new map's list: the header holds its size
+	{
+		buf.assign(need, 0);
+		const uint16_t w = (uint16_t)m_w, h = (uint16_t)m_h;
+		std::memcpy(&buf[10], &w, 2); std::memcpy(&buf[12], &h, 2);
+	}
+	if (buf.size() < need) buf.resize(need, 0);
+	const uint32_t count = (uint32_t)m_spr.size();
+	std::memcpy(&buf[4], &count, 4);
+	for (int i = m_sou2FileCount; i < (int)m_spr.size(); ++i)
+	{
+		const short e[2] = { m_spr[i].tileNo, (short)(m_spr[i].sourceNo + 1) };
+		std::memcpy(&buf[14 + (size_t)i * 4], e, 4);
+	}
+	if (Exists(sou2) && !Exists(sou2 + ".bak"))
+	{
+		std::ifstream in(sou2, std::ios::binary); std::ofstream bak(sou2 + ".bak", std::ios::binary);
+		bak << in.rdbuf();
+	}
+	const std::string tmp = sou2 + ".tmp";
+	{
+		std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+		if (!f) { err = "Can't write " + tmp; return false; }
+		f.write(buf.data(), buf.size());
+		if (!f) { err = "Writing " + tmp + " failed"; return false; }
+	}
+	std::remove(sou2.c_str());
+	if (std::rename(tmp.c_str(), sou2.c_str()) != 0) { err = "Could not replace " + sou2; return false; }
+	m_sou2Path = sou2; m_sou2FileCount = (int)m_spr.size(); m_sou2Dirty = false;
 	return true;
 }
 

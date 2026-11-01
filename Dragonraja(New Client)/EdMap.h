@@ -85,7 +85,7 @@ class EdMap
 public:
 	bool Load(const std::string& mapPath, std::string& err);
 	bool Save(const std::string& mapPath, std::string& err);			// writes the .map (and copies the .sou2 when saving under a new name)
-	void NewMap(int w, int h, const EdTile& fill);						// keeps the loaded pictures
+	void NewMap(int w, int h, const EdTile& fill, bool keepPictures = true);	// keeps the loaded pictures, or starts an empty .sou2 list
 
 	bool Loaded() const { return m_w > 0 && m_h > 0; }
 	int Width() const { return m_w; }
@@ -98,6 +98,10 @@ public:
 	const std::vector<EdSprite>& Sprites() const { return m_spr; }
 	int SpriteCount() const { return (int)m_spr.size(); }
 	const EdSprite* Sprite(int i) const { return i > 0 && i < (int)m_spr.size() && (m_spr[i].raw || !m_spr[i].data.empty()) ? &m_spr[i] : nullptr; }
+	// a picture taken from another map: its number here (added to the .sou2 list when this map lacks it), -1 = can't
+	int FindSprite(const EdSprite& sp) const;
+	int AddSprite(const EdSprite& sp, std::string& err);
+	bool PicturesChanged() const { return m_sou2Dirty; }
 
 	const std::string& Path() const { return m_path; }
 	const std::string& Name() const { return m_name; }
@@ -121,7 +125,11 @@ public:
 private:
 	bool LoadSources(const std::string& sou2, std::string& err);
 	bool LoadSingleSource(std::string& err);		// no .sou2: the whole <name>.sou, like the client
+	bool SaveSou2(const std::string& sou2, std::string& err);
 	int m_w = 0, m_h = 0;
+	int m_sou2FileCount = 0;		// .sou2 entries as read; the ones after it were added (AddSprite)
+	bool m_sou2Dirty = false;
+	bool m_singleSource = false;	// pictures from one whole .sou (no .sou2): nothing can be added
 	std::vector<EdTile> m_tiles;
 	std::vector<EdSprite> m_spr;
 	std::string m_path, m_name, m_folder, m_sou2Path;

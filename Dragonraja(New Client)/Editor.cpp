@@ -34,7 +34,7 @@ namespace
 	SDL_Window* s_window = nullptr;
 	SDL_Renderer* s_ren = nullptr;
 	EdMap s_map;
-	std::string s_status = "Open a map: File > Open (Ctrl+O), or drop a .map file on the window.";
+	std::string s_status = "Open a map: File > Open (Ctrl+O), or drop a .map file on the window. Or start one: File > New map (Ctrl+N).";
 	bool s_statusBad = false;
 	void Status(const std::string& m, bool bad = false) { s_status = m; s_statusBad = bad; }
 
@@ -44,12 +44,12 @@ namespace
 	void ClearObjTextures();
 	void SeamReset();
 	void ClearTextures() { for (Tex& t : s_tex) if (t.t) SDL_DestroyTexture(t.t); s_tex.clear(); ClearObjTextures(); SeamReset(); }
-	Tex* GetTex(int i)
+	Tex* GetTexOf(const EdMap& m, std::vector<Tex>& cache, int i)
 	{
-		const EdSprite* sp = s_map.Sprite(i);
+		const EdSprite* sp = m.Sprite(i);
 		if (!sp) return nullptr;
-		if ((int)s_tex.size() < s_map.SpriteCount()) s_tex.resize(s_map.SpriteCount());
-		Tex& t = s_tex[i];
+		if ((int)cache.size() < m.SpriteCount()) cache.resize(m.SpriteCount());
+		Tex& t = cache[i];
 		if (!t.tried)
 		{
 			t.tried = true;
@@ -70,6 +70,11 @@ namespace
 		}
 		return t.t ? &t : nullptr;
 	}
+	Tex* GetTex(int i) { return GetTexOf(s_map, s_tex, i); }
+	// another map to take tile pictures from (the "From map" tab)
+	EdMap s_src;
+	std::vector<Tex> s_srcTex;
+	void ClearSrcTextures() { for (Tex& t : s_srcTex) if (t.t) SDL_DestroyTexture(t.t); s_srcTex.clear(); }
 	ImTextureID TexId(Tex* t) { return (ImTextureID)(intptr_t)t->t; }
 	std::unordered_map<int, Tex> s_objTex;			// id * 16 + frame
 	void ClearObjTextures() { for (auto& kv : s_objTex) if (kv.second.t) SDL_DestroyTexture(kv.second.t); s_objTex.clear(); }
@@ -157,7 +162,7 @@ namespace
 	int s_selObj = -1, s_placeId = 0;
 	bool s_objDrag = false; float s_dragDX = 0, s_dragDY = 0;
 	std::vector<MapObj> s_dragBefore;
-	int s_leftTab = 0;					// 0 tiles, 1 objects
+	int s_leftTab = 0;					// 0 tiles, 1 objects, 2 tiles from another map
 	char s_objFilter[16] = "";
 	bool s_quitAsked = false, s_quitOk = false;
 	enum class Pending { None, Open, New, Quit, OpenPath } s_pending = Pending::None;
@@ -283,7 +288,12 @@ namespace
 		if (s_objDirty || s_map.ObjPath != oldObjPath)		// the objects go in their own file (<client>\object\<dir>\<MAP>.toi2)
 		{
 			const size_t k = s_map.ObjPath.find_last_of("\\/");
-			if (k != std::string::npos) CreateDirectoryA(s_map.ObjPath.substr(0, k).c_str(), nullptr);
+			if (k != std::string::npos)
+			{
+				const std::string dir = s_map.ObjPath.substr(0, k), up = dir.substr(0, dir.find_last_of("\\/"));
+				CreateDirectoryA(up.c_str(), nullptr);		// <client>\object (a new map in a folder that has none)
+				CreateDirectoryA(dir.c_str(), nullptr);
+			}
 			if (s_map.SaveObjects(err)) { s_objDirty = false; objMsg = " and " + std::to_string(s_map.Objects.size()) + " objects (" + s_map.ObjPath + ")"; }
 			else { Status("The map is saved but the objects are not: " + err, true); return false; }
 		}
@@ -982,16 +992,87 @@ namespace
 		}
 		ImGui::EndChild();
 	}
+	// tiles of another map: a click adds the picture to this map's list (if it isn't there) and paints with it
+	void SourcePalette()
+	{
+		if (ImGui::Button("Open map to take tiles from...", ImVec2(-1, 0)))
+		{
+			const std::string f = FileDialog(false, s_src.Loaded() ? s_src.Path() : s_map.Folder().empty() ? std::string() : s_map.Folder() + "\\");
+			if (!f.empty())
+			{
+				EdMap m; std::string err;
+				if (!m.Load(f, err)) Status(err, true);
+				else { ClearSrcTextures(); s_src = std::move(m); Status("Tiles from " + s_src.Name() + ": " + std::to_string(s_src.SpriteCount() - 1) + " pictures. Click one to paint with it."); }
+			}
+		}
+		if (!s_src.Loaded()) { Theme::Dim("Pick another map: its tile pictures show here.\nClicking one adds it to this map's\npicture list (.sou2) and selects it to paint."); return; }
+		ImGui::Text("%s", s_src.Name().c_str()); ImGui::SameLine(); Theme::Dim("%d pictures", s_src.SpriteCount() - 1);
+		ImGui::SetNextItemWidth(110); ImGui::Combo("##srclayer", &s_layer, LAYER_NAMES, 3);
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("The layer the picked tile is painted on");
+		if (s_map.Loaded()) { ImGui::SameLine(); Theme::Dim("%d / 3600 used here", s_map.SpriteCount()); }
+		const float box = 46.0f;
+		if (ImGui::BeginChild("##srcgrid", ImVec2(0, 0), false))
+		{
+			const int count = s_src.SpriteCount() - 1;
+			const int cols = std::max(1, (int)((ImGui::GetContentRegionAvail().x + 4) / (box + 4)));
+			const int rows = (count + cols - 1) / cols;
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+			ImGuiListClipper clip; clip.Begin(rows, box + 4);
+			while (clip.Step())
+				for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r)
+					for (int c = 0; c < cols; ++c)
+					{
+						const int idx = r * cols + c + 1;
+						if (idx > count) break;
+						if (c) ImGui::SameLine();
+						ImDrawList* dl = ImGui::GetWindowDrawList();
+						const ImVec2 p = ImGui::GetCursorScreenPos();
+						ImGui::PushID(idx);
+						const bool clicked = ImGui::InvisibleButton("##s", ImVec2(box, box));
+						const bool hov = ImGui::IsItemHovered();
+						const EdSprite* sp = s_src.Sprite(idx);
+						const int here = sp && s_map.Loaded() ? s_map.FindSprite(*sp) : -1;
+						dl->AddRectFilled(p, ImVec2(p.x + box, p.y + box), IM_COL32(8, 6, 4, 255));
+						if (Tex* t = GetTexOf(s_src, s_srcTex, idx))
+						{
+							const float s = std::min(1.0f, std::min((box - 4) / t->w, (box - 4) / t->h));
+							const float w = t->w * s, h = t->h * s;
+							const ImVec2 a(p.x + (box - w) * 0.5f, p.y + (box - h) * 0.5f);
+							dl->AddImage(TexId(t), a, ImVec2(a.x + w, a.y + h));
+							if (hov) ImGui::SetTooltip("%s #%d  %dx%d\nsource %d, tile %d\n%s", s_src.Name().c_str(), idx, t->w, t->h, sp->sourceNo + 1, sp->tileNo,
+								here > 0 ? ("already on this map as #" + std::to_string(here)).c_str() : "new to this map - clicking adds it");
+						}
+						dl->AddRect(p, ImVec2(p.x + box, p.y + box), here > 0 && here == s_selSprite ? Theme::Gold : hov ? Theme::GoldDim : IM_COL32(60, 44, 26, 255), 0, 0, here > 0 && here == s_selSprite ? 2.0f : 1.0f);
+						ImGui::PopID();
+						if (clicked && sp)
+						{
+							if (!s_map.Loaded()) { Status("Open the map to paint on, or make one (File > New map, Ctrl+N), first.", true); continue; }
+							std::string err;
+							const int before = s_map.SpriteCount();
+							const int got = s_map.AddSprite(*sp, err);
+							if (got < 0) { Status("Can't use that tile: " + err, true); continue; }
+							s_selSprite = got; s_tool = T_PAINT;
+							if (s_map.SpriteCount() != before) { s_dirty = true; ++s_gen; Status(s_src.Name() + " #" + std::to_string(idx) + " added to this map as #" + std::to_string(got) + " - paint with it; Save writes the .sou2 too."); }
+							else Status(s_src.Name() + " #" + std::to_string(idx) + " is #" + std::to_string(got) + " on this map - paint with it.");
+						}
+					}
+			ImGui::PopStyleVar();
+		}
+		ImGui::EndChild();
+	}
 	void Palette()
 	{
-		Theme::BeginPanel("##pal", s_leftTab ? "Objects" : "Tiles", ImVec2(0, 0));
+		Theme::BeginPanel("##pal", s_leftTab == 1 ? "Objects" : s_leftTab == 2 ? "From map" : "Tiles", ImVec2(0, 0));
 		if (ImGui::BeginTabBar("##lefttabs"))
 		{
 			if (ImGui::BeginTabItem("Tiles")) { s_leftTab = 0; ImGui::EndTabItem(); }
 			if (ImGui::BeginTabItem("Objects")) { s_leftTab = 1; ImGui::EndTabItem(); }
+			if (ImGui::BeginTabItem("From map")) { s_leftTab = 2; ImGui::EndTabItem(); }
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tiles from another map");
 			ImGui::EndTabBar();
 		}
 		if (s_leftTab == 1) { ObjectPalette(); Theme::EndPanel(); return; }
+		if (s_leftTab == 2) { SourcePalette(); Theme::EndPanel(); return; }
 		ImGui::SetNextItemWidth(110); ImGui::Combo("##layer", &s_layer, LAYER_NAMES, 3);
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip("The layer Paint / Erase / Fill / Pick work on");
 		ImGui::SameLine(); ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##pf", "go to #", s_paletteFilter, IM_ARRAYSIZE(s_paletteFilter), ImGuiInputTextFlags_CharsDecimal);
@@ -1249,8 +1330,7 @@ namespace
 		if (!ImGui::BeginMenuBar()) return;
 		if (ImGui::BeginMenu("File"))
 		{
-			if (ImGui::MenuItem("New map...", nullptr, false, s_map.SpriteCount() > 1)) Request(Pending::New);
-			if (ImGui::IsItemHovered() && s_map.SpriteCount() <= 1) ImGui::SetTooltip("Open a map first: a new map uses its tile pictures (.sou2)");
+			if (ImGui::MenuItem("New map...", "Ctrl+N")) Request(Pending::New);
 			if (ImGui::MenuItem("Open...", "Ctrl+O")) Request(Pending::Open);
 			if (ImGui::BeginMenu("Open recent", !s_recent.empty()))
 			{
@@ -1334,6 +1414,7 @@ namespace
 			if (ImGui::IsKeyPressed(ImGuiKey_V, false)) { if (s_clip.w) s_tool = T_STAMP; else Status("Nothing copied yet: Select tool, drag a box, Ctrl+C.", true); }
 			if (ImGui::IsKeyPressed(ImGuiKey_S, false)) DoSave(io.KeyShift);
 			if (ImGui::IsKeyPressed(ImGuiKey_O, false)) Request(Pending::Open);
+			if (ImGui::IsKeyPressed(ImGuiKey_N, false)) Request(Pending::New);
 			if (ImGui::IsKeyPressed(ImGuiKey_D, false) && s_tool == T_OBJECT && s_selObj >= 0 && s_selObj < (int)s_map.Objects.size())
 			{
 				std::vector<MapObj> b = s_map.Objects; MapObj c = s_map.Objects[s_selObj]; c.x += 16; c.y += 16;
@@ -1382,20 +1463,29 @@ namespace
 			if (ImGui::Button("Cancel", ImVec2(110, 0))) { s_pending = Pending::None; s_quitAsked = false; ImGui::CloseCurrentPopup(); }
 			ImGui::EndPopup();
 		}
-		if (s_askNew) { s_askNew = false; s_newW = s_map.Loaded() ? s_map.Width() : 200; s_newH = s_map.Loaded() ? s_map.Height() : 200; ImGui::OpenPopup("New map"); }
+		static bool s_newKeepPics = true;
+		if (s_askNew) { s_askNew = false; s_newW = s_map.Loaded() ? s_map.Width() : 200; s_newH = s_map.Loaded() ? s_map.Height() : 200; s_newKeepPics = s_map.SpriteCount() > 1; ImGui::OpenPopup("New map"); }
 		if (ImGui::BeginPopupModal("New map", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
 		{
-			ImGui::TextUnformatted("A new map with the tile pictures of the map that is open.");
+			const bool havePics = s_map.SpriteCount() > 1;
+			ImGui::BeginDisabled(!havePics);
+			ImGui::Checkbox(havePics ? ("Use the tile pictures of " + s_map.Name()).c_str() : "Use the tile pictures of the open map", &s_newKeepPics);
+			ImGui::EndDisabled();
+			const bool keep = havePics && s_newKeepPics;
+			if (!keep) Theme::Dim("Starts with no tile pictures: take them from other maps\nin the \"From map\" tab, then paint (Fill for the ground).");
 			ImGui::SetNextItemWidth(120); ImGui::InputInt("Width (tiles)", &s_newW); s_newW = std::max(20, std::min(720, s_newW));
 			ImGui::SetNextItemWidth(120); ImGui::InputInt("Height (tiles)", &s_newH); s_newH = std::max(20, std::min(720, s_newH));
-			ImGui::Text("Ground: tile #%d (pick it in the tile list first)", s_selSprite);
+			if (keep) ImGui::Text("Ground: tile #%d (pick it in the tile list first)", s_selSprite);
 			if (ImGui::Button("Create", ImVec2(120, 0)))
 			{
-				EdTile fill = {}; fill.back = (uint32_t)s_selSprite & 0xFFF;
-				s_map.NewMap(s_newW, s_newH, fill); SeamReset();
+				EdTile fill = {}; fill.back = keep ? (uint32_t)s_selSprite & 0xFFF : 0;
+				if (!keep) ClearTextures();
+				s_map.NewMap(s_newW, s_newH, fill, keep); SeamReset();
+				if (!keep) { s_selSprite = 1; s_leftTab = 2; }
 				s_undo.clear(); s_redo.clear(); s_dirty = true; s_minimapDirty = true; ++s_gen; s_selX = s_selY = -1; s_selObj = -1; s_objDirty = true;
 				CenterOn(s_newW / 2, s_newH / 2, s_viewW, s_viewH);
-				Status("New " + std::to_string(s_newW) + " x " + std::to_string(s_newH) + " map - Save as... to give it a name (its .sou2 is copied with it).");
+				Status("New " + std::to_string(s_newW) + " x " + std::to_string(s_newH) + " map - " + (keep ? "Save as... to give it a name (its .sou2 is copied with it)." : "take tiles from another map in the From map tab, then Save as... to name it (a new .sou2 is written)."));
+				if (s_window) SDL_SetWindowTitle(s_window, "Dragon Raja Map Editor - untitled");
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::SameLine(); if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
@@ -1421,7 +1511,7 @@ namespace
 namespace Editor
 {
 	bool Init(SDL_Window* window, SDL_Renderer* renderer) { s_window = window; s_ren = renderer; LoadIni(); return true; }
-	void Shutdown() { ClearTextures(); if (s_minimap) SDL_DestroyTexture(s_minimap); s_minimap = nullptr; if (s_canvas) SDL_DestroyTexture(s_canvas); s_canvas = nullptr; }
+	void Shutdown() { ClearTextures(); ClearSrcTextures(); if (s_minimap) SDL_DestroyTexture(s_minimap); s_minimap = nullptr; if (s_canvas) SDL_DestroyTexture(s_canvas); s_canvas = nullptr; }
 	bool OpenMap(const std::string& path) { return DoOpen(path); }
 	bool WantsQuit() { return s_quitOk; }
 
