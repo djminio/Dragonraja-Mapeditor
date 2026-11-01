@@ -1,0 +1,32 @@
+# build output / IDE
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.user
+imgui.ini
+mapeditor.ini
+
+# game data (maps, .sou pictures) - lives in the client folder
+Map/
+
+# editor backups
+*bak
+*.bak
+*.tmp
+Dragonraja(New Client)/_old_backup/
+
+# separate repo (djminio/New-DR-Client), not part of the editor build
+Dragonraja(New Client)/New DR Client/
+
+# imgui: only the files the editor builds with
+/imgui/*
+!/imgui/LICENSE.txt
+!/imgui/imconfig.h
+!/imgui/imgui*.h
+!/imgui/imgui*.cpp
+!/imgui/imstb_*.h
+!/imgui/backends/
+/imgui/backends/*
+!/imgui/backends/imgui_impl_sdl2.*
+!/imgui/backends/imgui_impl_sdlrenderer2.*
