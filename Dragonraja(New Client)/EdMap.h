@@ -102,6 +102,9 @@ public:
 	int FindSprite(const EdSprite& sp) const;
 	int AddSprite(const EdSprite& sp, std::string& err);
 	bool PicturesChanged() const { return m_sou2Dirty; }
+	// a recolored copy of a picture: goes into a free (placeholder) slot of the 11.sou sheet, written by Save
+	int AddRecolored(const EdSprite& sp, std::string& err);
+	std::string SheetPath(int source) const;		// where <source>.sou is ("" = not found)
 
 	const std::string& Path() const { return m_path; }
 	const std::string& Name() const { return m_name; }
@@ -126,6 +129,8 @@ private:
 	bool LoadSources(const std::string& sou2, std::string& err);
 	bool LoadSingleSource(std::string& err);		// no .sou2: the whole <name>.sou, like the client
 	bool SaveSou2(const std::string& sou2, std::string& err);
+	bool SaveSheetPictures(std::string& err);		// writes the AddRecolored pictures into their sheet
+	std::vector<int> m_newSheetPics;				// m_spr indexes waiting to be written into a sheet
 	int m_w = 0, m_h = 0;
 	int m_sou2FileCount = 0;		// .sou2 entries as read; the ones after it were added (AddSprite)
 	bool m_sou2Dirty = false;
@@ -147,3 +152,13 @@ inline void Rgb565ToRgba(uint16_t p, uint8_t* o)
 // a sprite as RGBA pixels (W*H*4); transparent where an RLE sprite skips. false = broken data
 // outW / outH: the real size - the game's RLE rows often run one pixel past xl (the client draws them, so do we)
 bool DecodeSprite(const EdSprite& s, std::vector<uint8_t>& rgba, int* outW = nullptr, int* outH = nullptr);
+
+// colour change for a picture: hue turn (degrees), saturation / brightness multipliers, then a pull towards a tint colour
+struct Recolor
+{
+	float hue = 0, sat = 1, bright = 1;
+	float tint[3] = { 1, 1, 1 }, tintAmount = 0;		// tint colour 0..1, 0 = none, 1 = fully that colour (keeps the shading)
+	bool Identity() const { return hue == 0 && sat == 1 && bright == 1 && tintAmount == 0; }
+};
+// the same picture with every pixel changed (pure black is left alone); where it came from is kept
+EdSprite RecolorSprite(const EdSprite& s, const Recolor& rc);

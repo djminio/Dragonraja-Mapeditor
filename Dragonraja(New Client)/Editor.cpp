@@ -998,6 +998,70 @@ namespace
 		}
 		ImGui::EndChild();
 	}
+	// recolour the selected tile: a live preview, then "Add" makes it a new picture (a free 11.sou slot, written on Save)
+	Recolor s_rc;
+	SDL_Texture* s_rcTex = nullptr; int s_rcW = 0, s_rcH = 0; const EdSprite* s_rcFor = nullptr; Recolor s_rcMade;
+	void RecolorPanel()
+	{
+		if (!ImGui::CollapsingHeader("Recolor selected tile")) return;
+		const EdSprite* sp = s_map.Sprite(s_selSprite);
+		if (!sp) { Theme::Dim("Pick a tile in the list first."); return; }
+		ImGui::PushItemWidth(-60);
+		ImGui::SliderFloat("Hue", &s_rc.hue, -180, 180, "%.0f deg");
+		ImGui::SliderFloat("Saturation", &s_rc.sat, 0, 2, "x%.2f");
+		ImGui::SliderFloat("Brightness", &s_rc.bright, 0, 2, "x%.2f");
+		ImGui::ColorEdit3("Tint", s_rc.tint, ImGuiColorEditFlags_NoInputs); ImGui::SameLine(); ImGui::SetNextItemWidth(-60);
+		ImGui::SliderFloat("##tintamt", &s_rc.tintAmount, 0, 1, "tint %.2f");
+		ImGui::PopItemWidth();
+		// the preview, made again when the tile or a slider changes
+		if (s_rcFor != sp || std::memcmp(&s_rcMade, &s_rc, sizeof(Recolor)) != 0)
+		{
+			if (s_rcTex) SDL_DestroyTexture(s_rcTex);
+			s_rcTex = nullptr; s_rcFor = sp; s_rcMade = s_rc;
+			std::vector<uint8_t> px;
+			if (DecodeSprite(RecolorSprite(*sp, s_rc), px, &s_rcW, &s_rcH))
+			{
+				s_rcTex = SDL_CreateTexture(s_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, s_rcW, s_rcH);
+				if (s_rcTex) { SDL_UpdateTexture(s_rcTex, nullptr, px.data(), s_rcW * 4); SDL_SetTextureBlendMode(s_rcTex, SDL_BLENDMODE_BLEND); }
+			}
+		}
+		const float box = 64.0f;
+		auto show = [&](SDL_Texture* t, int w, int h)
+		{
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			const ImVec2 p = ImGui::GetCursorScreenPos();
+			ImGui::Dummy(ImVec2(box, box));
+			dl->AddRectFilled(p, ImVec2(p.x + box, p.y + box), IM_COL32(8, 6, 4, 255));
+			if (t && w > 0 && h > 0)
+			{
+				const float s = std::min(2.0f, std::min((box - 4) / w, (box - 4) / h));
+				const ImVec2 a(p.x + (box - w * s) * 0.5f, p.y + (box - h * s) * 0.5f);
+				dl->AddImage((ImTextureID)(intptr_t)t, a, ImVec2(a.x + w * s, a.y + h * s));
+			}
+			dl->AddRect(p, ImVec2(p.x + box, p.y + box), IM_COL32(60, 44, 26, 255));
+		};
+		Tex* orig = GetTex(s_selSprite);
+		show(orig ? orig->t : nullptr, orig ? orig->w : 0, orig ? orig->h : 0); ImGui::SameLine(); show(s_rcTex, s_rcW, s_rcH);
+		ImGui::SameLine();
+		ImGui::BeginGroup();
+		if (ImGui::Button("Reset")) s_rc = Recolor();
+		ImGui::BeginDisabled(s_rc.Identity());
+		if (ImGui::Button("Add as new tile"))
+		{
+			std::string err;
+			const int got = s_map.AddRecolored(RecolorSprite(*sp, s_rc), err);
+			if (got < 0) Status("Can't add the recolored tile: " + err, true);
+			else
+			{
+				const EdSprite* n = s_map.Sprite(got);
+				Status("Recolored tile added as #" + std::to_string(got) + " (11.sou slot " + std::to_string(n ? n->tileNo : 0) + ") and selected to paint. Save writes 11.sou too - players need the new 11.sou (updater).");
+				s_selSprite = got; s_tool = T_PAINT; s_dirty = true; ++s_gen;
+			}
+		}
+		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Makes a new tile picture from this one with these colours,\nstored in a free slot of 11.sou when you save.\nThe original tile is not changed.");
+		ImGui::EndGroup();
+	}
 	// objects of another map: object pictures are shared by id (<client>\object\<n>\<id>.csp), so a click just
 	// places copies of the first one of that id, with its settings (animation, light, sound, boxes)
 	void SourceObjects()
@@ -1153,6 +1217,7 @@ namespace
 			const EdSprite* sp = s_map.Sprite(s_selSprite);
 			ImGui::Text("Selected #%d", s_selSprite); ImGui::SameLine();
 			Theme::Dim("%s", sp ? (sp->raw ? "ground tile" : (std::to_string(sp->xl) + "x" + std::to_string(sp->yl)).c_str()) : "-");
+			RecolorPanel();
 		}
 		const float box = 46.0f;
 		if (ImGui::BeginChild("##palgrid", ImVec2(0, 0), false))
@@ -1579,7 +1644,7 @@ namespace
 namespace Editor
 {
 	bool Init(SDL_Window* window, SDL_Renderer* renderer) { s_window = window; s_ren = renderer; LoadIni(); return true; }
-	void Shutdown() { ClearTextures(); ClearSrcTextures(); ClearSrcObjTextures(); if (s_minimap) SDL_DestroyTexture(s_minimap); s_minimap = nullptr; if (s_canvas) SDL_DestroyTexture(s_canvas); s_canvas = nullptr; }
+	void Shutdown() { ClearTextures(); ClearSrcTextures(); ClearSrcObjTextures(); if (s_rcTex) SDL_DestroyTexture(s_rcTex); s_rcTex = nullptr; if (s_minimap) SDL_DestroyTexture(s_minimap); s_minimap = nullptr; if (s_canvas) SDL_DestroyTexture(s_canvas); s_canvas = nullptr; }
 	bool OpenMap(const std::string& path) { return DoOpen(path); }
 	bool WantsQuit() { return s_quitOk; }
 

@@ -5,6 +5,9 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
+#include <cmath>
+#include <sstream>
 
 namespace
 {
@@ -227,7 +230,7 @@ void EdMap::NewMap(int w, int h, const EdTile& fill, bool keepPictures)
 {
 	if (!keepPictures || m_spr.empty())		// an empty picture list: pictures come from other maps (AddSprite)
 	{
-		m_spr.assign(1, EdSprite());
+		m_spr.assign(1, EdSprite()); m_newSheetPics.clear();
 		m_sou2Path.clear(); m_sou2FileCount = 0; m_sou2Dirty = true; m_singleSource = false;
 	}
 	m_w = w; m_h = h; m_tiles.assign((size_t)w * h, fill);
@@ -238,6 +241,8 @@ void EdMap::NewMap(int w, int h, const EdTile& fill, bool keepPictures)
 
 bool EdMap::Save(const std::string& mapPath, std::string& err)
 {
+	// recoloured pictures first: the map must not point at sheet slots that were never written
+	if (!SaveSheetPictures(err)) { err = "Nothing saved - the recolored tiles could not be written: " + err; return false; }
 	// first save over an existing file: keep the original as <file>.bak
 	if (Exists(mapPath) && !Exists(mapPath + ".bak"))
 	{
@@ -348,6 +353,192 @@ bool EdMap::SaveSou2(const std::string& sou2, std::string& err)
 	std::remove(sou2.c_str());
 	if (std::rename(tmp.c_str(), sou2.c_str()) != 0) { err = "Could not replace " + sou2; return false; }
 	m_sou2Path = sou2; m_sou2FileCount = (int)m_spr.size(); m_sou2Dirty = false;
+	return true;
+}
+
+// ===================================================================== recoloured pictures
+namespace
+{
+	// a .sou sheet: short count, DWORD offset[count], then per picture DWORD size + size bytes
+	// (raw: short -1, short 0, 32*32 RGB565; RLE: short xl, yl, ox, oy, DWORD n, n bytes)
+	bool ReadSheet(const std::string& path, std::vector<std::vector<char>>& recs, std::string& err)
+	{
+		std::ifstream f(path, std::ios::binary);
+		if (!f) { err = "Can't open " + path; return false; }
+		std::vector<char> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		if (b.size() < 2) { err = FileOf(path) + " is empty"; return false; }
+		short n = 0; std::memcpy(&n, b.data(), 2);
+		if (n <= 0 || b.size() < 2 + (size_t)n * 4) { err = FileOf(path) + ": bad picture count"; return false; }
+		recs.assign(n, std::vector<char>());
+		for (int i = 0; i < n; ++i)
+		{
+			uint32_t off = 0, size = 0; std::memcpy(&off, &b[2 + (size_t)i * 4], 4);
+			if ((size_t)off + 4 > b.size()) { err = FileOf(path) + ": picture " + std::to_string(i) + " is past the end"; return false; }
+			std::memcpy(&size, &b[off], 4);
+			if ((size_t)off + 4 + size > b.size()) { err = FileOf(path) + ": picture " + std::to_string(i) + " is cut short"; return false; }
+			recs[i].assign(b.begin() + off, b.begin() + off + 4 + size);
+		}
+		return true;
+	}
+	bool WriteSheet(const std::string& path, const std::vector<std::vector<char>>& recs, std::string& err)
+	{
+		if (Exists(path) && !Exists(path + ".bak"))
+		{
+			std::ifstream in(path, std::ios::binary); std::ofstream bak(path + ".bak", std::ios::binary);
+			bak << in.rdbuf();
+		}
+		const std::string tmp = path + ".tmp";
+		{
+			std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+			if (!f) { err = "Can't write " + tmp; return false; }
+			Wr(f, (short)recs.size());
+			uint32_t off = 2 + (uint32_t)recs.size() * 4;
+			for (const std::vector<char>& r : recs) { Wr(f, off); off += (uint32_t)r.size(); }
+			for (const std::vector<char>& r : recs) f.write(r.data(), r.size());
+			if (!f) { err = "Writing " + tmp + " failed (disk full?)"; return false; }
+		}
+		std::remove(path.c_str());
+		if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "Could not replace " + path + " (is the game running?)"; return false; }
+		return true;
+	}
+	std::vector<char> SheetRecord(const EdSprite& s)
+	{
+		std::ostringstream o(std::ios::binary);
+		if (s.raw) { Wr(o, (uint32_t)(4 + s.data.size())); Wr(o, (short)-1); Wr(o, (short)0); }
+		else { Wr(o, (uint32_t)(12 + s.data.size())); Wr(o, s.xl); Wr(o, s.yl); Wr(o, s.ox); Wr(o, s.oy); Wr(o, (uint32_t)s.data.size()); }
+		o.write(reinterpret_cast<const char*>(s.data.data()), s.data.size());
+		const std::string str = o.str();
+		return std::vector<char>(str.begin(), str.end());
+	}
+
+	uint16_t RecolorPixel(uint16_t p, const Recolor& rc)
+	{
+		if (p == 0) return 0;			// black stays black
+		float r = ((p >> 11) & 31) / 31.0f, g = ((p >> 5) & 63) / 63.0f, b = (p & 31) / 31.0f;
+		const float mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b)), d = mx - mn;
+		float h = 0, s = mx > 0 ? d / mx : 0, v = mx;
+		if (d > 0)
+		{
+			if (mx == r) h = 60.0f * std::fmod((g - b) / d + 6.0f, 6.0f);
+			else if (mx == g) h = 60.0f * ((b - r) / d + 2.0f);
+			else h = 60.0f * ((r - g) / d + 4.0f);
+		}
+		h = std::fmod(h + rc.hue + 720.0f, 360.0f);
+		s = std::min(1.0f, std::max(0.0f, s * rc.sat));
+		v = std::min(1.0f, std::max(0.0f, v * rc.bright));
+		const float c = v * s, x = c * (1 - std::fabs(std::fmod(h / 60.0f, 2.0f) - 1)), m = v - c;
+		const int k = (int)(h / 60.0f) % 6;
+		const float rr[6] = { c, x, 0, 0, x, c }, gg[6] = { x, c, c, x, 0, 0 }, bb[6] = { 0, 0, x, c, c, x };
+		r = rr[k] + m; g = gg[k] + m; b = bb[k] + m;
+		if (rc.tintAmount > 0)		// towards the tint colour, keeping how light the pixel is
+		{
+			const float l = 0.299f * r + 0.587f * g + 0.114f * b, a = std::min(1.0f, rc.tintAmount);
+			r += (std::min(1.0f, l * rc.tint[0] * 1.6f) - r) * a;
+			g += (std::min(1.0f, l * rc.tint[1] * 1.6f) - g) * a;
+			b += (std::min(1.0f, l * rc.tint[2] * 1.6f) - b) * a;
+		}
+		const int R = (int)std::lround(std::min(1.0f, std::max(0.0f, r)) * 31), G = (int)std::lround(std::min(1.0f, std::max(0.0f, g)) * 63), B = (int)std::lround(std::min(1.0f, std::max(0.0f, b)) * 31);
+		const uint16_t out = (uint16_t)((R << 11) | (G << 5) | B);
+		return out ? out : (uint16_t)0x0821;		// a changed pixel never turns into pure black
+	}
+}
+
+EdSprite RecolorSprite(const EdSprite& s, const Recolor& rc)
+{
+	EdSprite o = s;
+	uint8_t* p = o.data.data();
+	uint8_t* const end = p + o.data.size();
+	auto px = [&](uint8_t* q) { const uint16_t v = RecolorPixel((uint16_t)(q[0] | (q[1] << 8)), rc); q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); };
+	if (s.raw) { for (; p + 1 < end; p += 2) px(p); return o; }
+	// RLE rows: (skip, count, count bytes of pixels)... 0xFFFF - only the pixel bytes change
+	for (int y = 0; y < s.yl && p + 2 <= end; ++y)
+		for (;;)
+		{
+			if (p + 2 > end) break;
+			const uint16_t skip = (uint16_t)(p[0] | (p[1] << 8)); p += 2;
+			if (skip == 0xFFFF) break;
+			if (p + 2 > end) break;
+			const uint16_t count = (uint16_t)(p[0] | (p[1] << 8)); p += 2;
+			if (p + count > end) { p = end; break; }
+			for (int i = 0; i + 1 < count; i += 2) px(p + i);
+			p += count;
+		}
+	return o;
+}
+
+std::string EdMap::SheetPath(int source) const
+{
+	if (source < 0 || source >= 11) return std::string();
+	const std::string name = std::string(SOURCES[source]) + ".sou";
+	std::vector<std::string> tries;
+	if (!m_folder.empty()) { tries.push_back(m_folder + "\\" + name); tries.push_back(m_folder + "\\..\\map\\" + name); }
+	for (const std::string& r : ClientRoots) if (!r.empty()) tries.push_back(r + "\\map\\" + name);
+	tries.push_back(name);
+	for (const std::string& t : tries) if (Exists(t)) return t;
+	return std::string();
+}
+
+int EdMap::AddRecolored(const EdSprite& sp, std::string& err)
+{
+	const int SHEET = 10;		// 11.sou: about half its slots are unused (they hold slot 0's placeholder)
+	if (m_singleSource || m_spr.empty()) { err = m_name + " has no .sou2 picture list to add to"; return -1; }
+	if (m_spr.size() >= 3600) { err = m_name + " already uses 3600 pictures, the most the client loads"; return -1; }
+	if (!sp.raw && sp.data.empty()) { err = "No picture"; return -1; }
+	const std::string sheet = SheetPath(SHEET);
+	if (sheet.empty()) { err = "Can't find 11.sou next to the map or in the client's map folder"; return -1; }
+	std::vector<std::vector<char>> recs;
+	if (!ReadSheet(sheet, recs, err)) return -1;
+
+	std::vector<char> taken(recs.size(), 0);
+	taken[0] = 1;
+	for (size_t i = 1; i < recs.size(); ++i) if (recs[i] != recs[0]) taken[i] = 1;
+	// placeholder slots some map still points at (sky1 / sky2 do) stay as they are
+	std::error_code ec;
+	for (const auto& e : std::filesystem::directory_iterator(FolderOf(sheet), ec))
+	{
+		std::string ext = Upper(e.path().extension().string());
+		if (ext != ".SOU2") continue;
+		std::ifstream f(e.path(), std::ios::binary);
+		uint32_t fs = 0, no = 0;
+		if (!Rd(f, fs) || !Rd(f, no)) continue;
+		f.seekg(6, std::ios::cur);
+		for (uint32_t i = 0; i < no && i < 3600; ++i)
+		{
+			short t = 0, src = 0;
+			if (!Rd(f, t) || !Rd(f, src)) break;
+			if (src - 1 == SHEET && t >= 0 && t < (int)taken.size()) taken[t] = 1;
+		}
+	}
+	for (const EdSprite& s : m_spr) if (s.sourceNo == SHEET && s.tileNo >= 0 && s.tileNo < (int)taken.size()) taken[s.tileNo] = 1;
+	int slot = -1;
+	for (size_t i = 1; i < taken.size(); ++i) if (!taken[i]) { slot = (int)i; break; }
+	if (slot < 0) { err = "11.sou has no free slot left"; return -1; }
+
+	EdSprite n = sp;
+	n.sourceNo = (short)SHEET; n.tileNo = (short)slot;
+	m_spr.push_back(n);
+	m_newSheetPics.push_back((int)m_spr.size() - 1);
+	m_sou2Dirty = true;
+	return (int)m_spr.size() - 1;
+}
+
+bool EdMap::SaveSheetPictures(std::string& err)
+{
+	if (m_newSheetPics.empty()) return true;
+	const int SHEET = m_spr[m_newSheetPics[0]].sourceNo;
+	const std::string sheet = SheetPath(SHEET);
+	if (sheet.empty()) { err = std::string("Can't find ") + SOURCES[SHEET] + ".sou"; return false; }
+	std::vector<std::vector<char>> recs;
+	if (!ReadSheet(sheet, recs, err)) return false;
+	for (int i : m_newSheetPics)
+	{
+		const EdSprite& s = m_spr[i];
+		if (s.tileNo <= 0 || s.tileNo >= (int)recs.size()) { err = "Bad sheet slot " + std::to_string(s.tileNo); return false; }
+		if (recs[s.tileNo] != recs[0]) { err = FileOf(sheet) + " slot " + std::to_string(s.tileNo) + " was filled by something else since - recolor the tile again"; return false; }
+		recs[s.tileNo] = SheetRecord(s);
+	}
+	if (!WriteSheet(sheet, recs, err)) return false;
+	m_newSheetPics.clear();
 	return true;
 }
 
